@@ -1,0 +1,12 @@
+# Rahasia: kata sandi database + dua kunci (sesi & webhook). TIDAK PERNAH masuk git.
+.env
+
+# Ketergantungan
+node_modules/
+
+# Hasil build
+.next/
+next-env.d.ts
+
+# Catatan kerja lokal
+*.log

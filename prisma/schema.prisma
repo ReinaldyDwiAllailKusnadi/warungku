@@ -1,0 +1,270 @@
+// Skema Warungku — pesanan warung makanan dengan pembayaran.
+//
+// KONSEP BARU DI PROYEK INI (belum ada di enam proyek sebelumnya):
+// pembayaran tidak terjadi di dalam aplikasi ini. Ada PIHAK KETIGA yang
+// menagih pelanggan, lalu memberi tahu kita lewat panggilan masuk
+// (webhook) bahwa uangnya sudah masuk. Konsekuensinya berantai, dan
+// hampir semuanya soal uang:
+//
+//   1. Peramban TIDAK BOLEH bisa menandai pesanan sebagai terbayar.
+//      Pelanggan bisa saja membuka sendiri alamat "pembayaran selesai".
+//      Satu-satunya yang boleh menandai terbayar adalah webhook yang
+//      terbukti asli.
+//   2. Webhook yang sama bisa datang DUA KALI. Penyedia pembayaran
+//      mengirim ulang kalau mereka tidak yakin kita menerimanya. Kalau
+//      tidak dijaga, satu pesanan tercatat terbayar dua kali.
+//   3. Nominal yang dibayar harus DIPERIKSA sama dengan yang kita minta.
+//      Webhook yang asli tapi nominalnya beda tetap tidak boleh
+//      menandai lunas.
+//   4. Status pesanan berpindah menurut aturan, bukan sesuka pemanggil.
+//      "Menunggu bayar" tidak boleh langsung lompat ke "siap".
+
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  // KENAPA "prisma-client-js", BUKAN "prisma-client":
+  //   Generator baru ("prisma-client") mewajibkan jalur keluaran ditulis
+  //   sendiri, dan tanpa itu kliennya tidak terbentuk di tempat yang
+  //   dicari @prisma/client — galatnya menyesatkan: "Cannot find module
+  //   '.prisma/client/default'". Generator lama meletakkannya di tempat
+  //   yang sudah dipakai proyek-proyek sebelumnya, jadi polanya sama.
+  provider = "prisma-client-js"
+}
+
+// ---------------------------------------------------------------- jenis
+
+/// Cara pesanan diserahkan ke pelanggan.
+enum TipePesan {
+  DIAMBIL // pelanggan mengambil sendiri di warung
+  ANTAR // dikirim, ada biaya antar
+}
+
+/// Perjalanan satu pesanan. Urutannya sengaja tidak banyak supaya
+/// benar-benar bisa dijaga: dari MENUNGGU_BAYAR hanya boleh maju ke
+/// DIBAYAR atau berhenti di DIBATALKAN.
+enum StatusPesanan {
+  MENUNGGU_BAYAR // sudah dibuat, uang belum masuk
+  DIBAYAR // webhook yang sah sudah mengonfirmasi
+  DIMASAK // dapur sedang mengerjakan
+  SIAP // menunggu diambil / dikirim
+  SELESAI // sudah diterima pelanggan
+  DIBATALKAN // batal sebelum dibayar, atau kedaluwarsa
+}
+
+/// Status satu percobaan pembayaran di sisi penyedia.
+enum StatusBayar {
+  MENUNGGU
+  BERHASIL
+  GAGAL
+  KEDALUWARSA
+}
+
+// ---------------------------------------------------------------- menu
+
+model Kategori {
+  id     String @id @default(cuid())
+  nama   String
+  urutan Int    @default(0)
+
+  menu Menu[]
+
+  @@map("kategori")
+}
+
+model Menu {
+  id         String  @id @default(cuid())
+  kategoriId String
+  kategori   Kategori @relation(fields: [kategoriId], references: [id], onDelete: Cascade)
+  nama       String
+  slug       String  @unique
+  keterangan String?
+  /// Harga dalam RUPIAH PENUH (bilangan bulat). Tidak memakai pecahan
+  /// desimal apa pun — pembulatan uang adalah sumber selisih yang paling
+  /// sering muncul, dan rupiah tidak punya pecahan di bawah 1.
+  harga      Int
+  /// Tingkat pedas 0-3, ditampilkan sebagai penanda — bukan emoji.
+  pedas      Int     @default(0)
+  tersedia   Boolean @default(true)
+  urutan     Int     @default(0)
+
+  item ItemPesanan[]
+
+  @@map("menu")
+}
+
+// ---------------------------------------------------------------- pesanan
+
+model Pesanan {
+  id      String @id @default(cuid())
+  /// Nomor yang disebut pelanggan saat menanyakan pesanannya.
+  /// Dibuat di dalam transaksi dengan penguncian baris — dua pesanan
+  /// bersamaan tidak boleh mendapat nomor yang sama.
+  nomor   String @unique
+
+  nama    String
+  telepon String
+  tipe    TipePesan
+  /// Wajib diisi kalau tipe = ANTAR. Ditegakkan di server, bukan di
+  /// peramban — peramban bisa dimatikan.
+  alamat  String?
+  catatan String?
+
+  /// KETIGA ANGKA DI BAWAH DIHITUNG SERVER dan disimpan apa adanya saat
+  /// pesanan dibuat. Peramban tidak mengirim satu pun dari ketiganya.
+  subtotal   Int
+  biayaAntar Int @default(0)
+  total      Int
+
+  status StatusPesanan @default(MENUNGGU_BAYAR)
+
+  dibuat      DateTime @default(now())
+  /// Batas waktu pembayaran. Lewat dari ini pesanan dibatalkan sendiri
+  /// supaya menu tidak tertahan selamanya oleh pesanan yang tak dibayar.
+  kedaluwarsa DateTime
+  /// Diisi saat webhook yang sah mengonfirmasi pembayaran. Sumber
+  /// kebenaran "kapan uangnya masuk" — bukan waktu pesanan dibuat.
+  dibayarPada DateTime?
+
+  item      ItemPesanan[]
+  pembayaran Pembayaran[]
+  peristiwa PeristiwaPesanan[]
+
+  @@index([status])
+  @@index([telepon])
+  @@map("pesanan")
+}
+
+model ItemPesanan {
+  id        String  @id @default(cuid())
+  pesananId String
+  pesanan   Pesanan @relation(fields: [pesananId], references: [id], onDelete: Cascade)
+  menuId    String
+  menu      Menu    @relation(fields: [menuId], references: [id])
+
+  /// SALINAN nama dan harga pada saat pesanan dibuat.
+  ///
+  /// KENAPA DISALIN, BUKAN DIBACA DARI TABEL MENU:
+  ///   Kalau harga naik besok, pesanan yang sudah dibuat hari ini harus
+  ///   tetap menagih harga yang disepakati hari ini. Membaca harga dari
+  ///   tabel menu membuat nota lama berubah sendiri mengikuti harga baru
+  ///   — dan pelanggan yang menyimpan notanya akan melihat angka yang
+  ///   berbeda dari yang dia bayar.
+  namaSaatItu  String
+  hargaSaatItu Int
+  jumlah       Int
+
+  @@map("item_pesanan")
+}
+
+// ---------------------------------------------------------------- pembayaran
+
+model Pembayaran {
+  id        String  @id @default(cuid())
+  pesananId String
+  pesanan   Pesanan @relation(fields: [pesananId], references: [id], onDelete: Cascade)
+
+  /// Nama penyedia pembayaran. Di proyek latihan ini berisi "tiruan"
+  /// (lihat lib/pembayaran.ts) — bukan penyedia sungguhan.
+  penyedia String
+  /// ID tagihan di sisi penyedia. Unik supaya tagihan yang sama tidak
+  /// bisa tercatat dua kali untuk dua pesanan berbeda.
+  referensi String @unique
+
+  jumlah     Int
+  status     StatusBayar @default(MENUNGGU)
+  tautanBayar String
+  kedaluwarsa DateTime
+  dibayarPada DateTime?
+  dibuat      DateTime   @default(now())
+
+  @@map("pembayaran")
+}
+
+// ---------------------------------------------------------------- catatan
+
+/// Catatan SETIAP perpindahan status. Tanpa ini, pertanyaan "kenapa
+/// pesanan ini batal?" hanya bisa dijawab dengan menebak. Isinya juga
+/// membedakan perubahan yang dilakukan petugas dari yang dilakukan
+/// sistem (webhook, kedaluwarsa).
+model PeristiwaPesanan {
+  id        String  @id @default(cuid())
+  pesananId String
+  pesanan   Pesanan @relation(fields: [pesananId], references: [id], onDelete: Cascade)
+
+  dari  StatusPesanan?
+  ke    StatusPesanan
+  /// "webhook" | "kasir" | "kedaluwarsa" | "dibuat"
+  sebab String
+  /// Nama petugas, kalau perubahannya dilakukan manusia.
+  oleh  String?
+  waktu DateTime @default(now())
+
+  @@index([pesananId])
+  @@map("peristiwa_pesanan")
+}
+
+/// Kunci IDEMPOTENSI untuk webhook.
+///
+/// KENAPA TABEL SENDIRI, BUKAN CUKUP MEMERIKSA STATUS PESANAN:
+///   Memeriksa status saja tidak cukup untuk jenis webhook lain
+///   (misalnya "pembayaran gagal" atau "pengembalian dana") yang bisa
+///   datang berulang tanpa mengubah status. Dengan menyimpan setiap ID
+///   peristiwa yang pernah diproses, webhook yang datang kedua kali
+///   dikenali dari ID-nya, bukan dari dugaan tentang efeknya.
+model PeristiwaWebhook {
+  id       String   @id @default(cuid())
+  /// ID peristiwa dari penyedia. UNIK — inilah kunci idempotensinya.
+  eventId  String   @unique
+  jenis    String
+  ringkas  String
+  diterima DateTime @default(now())
+
+  @@map("peristiwa_webhook")
+}
+
+/// Peran petugas.
+///
+/// KENAPA ENUM, BUKAN TEKS BEBAS:
+///   Sebagai teks bebas, kolom ini menerima apa saja — "Kasir", "kasir",
+///   "kasiir" semuanya masuk tanpa keluhan, dan pemeriksaan wewenang
+///   yang membandingkan dengan "KASIR" akan diam-diam menolak orang yang
+///   sebenarnya berhak. Sebagai enum, nilai yang salah ditolak oleh
+///   database saat ditulis, bukan berbulan-bulan kemudian saat ada yang
+///   bertanya kenapa petugasnya tidak bisa masuk.
+enum Peran {
+  KASIR
+  DAPUR
+}
+
+/// Petugas warung.
+///
+/// PERAN DIBACA DARI DATABASE SETIAP KALI, bukan dari isi cookie.
+/// Cookie hanya menyimpan id. Kalau peran seorang petugas diturunkan,
+/// perubahan itu langsung berlaku pada permintaan berikutnya — tanpa
+/// menunggu sesinya kedaluwarsa.
+model Pengguna {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  nama      String
+  sandiHash String
+  /// KASIR — boleh memproses seluruh perpindahan status.
+  /// DAPUR — hanya boleh memindahkan dibayar -> dimasak -> siap.
+  ///         Menutup pesanan (siap -> selesai) urusan kasir, karena di
+  ///         situ uang dan sisa pesanan dicocokkan.
+  peran     Peran    @default(KASIR)
+  aktif     Boolean  @default(true)
+  dibuat    DateTime @default(now())
+
+  @@map("pengguna")
+}
+
+/// Penghitung nomor pesanan. Satu baris per jenis nomor per tahun.
+model Penghitung {
+  id       String @id @default(cuid())
+  nama     String @unique
+  terakhir Int    @default(0)
+
+  @@map("penghitung")
+}
