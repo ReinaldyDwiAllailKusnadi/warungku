@@ -7,6 +7,7 @@ node_modules/
 # Hasil build
 .next/
 next-env.d.ts
+tsconfig.tsbuildinfo
 
 # Catatan kerja lokal
 *.log
